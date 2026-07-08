@@ -9,9 +9,12 @@ Licensed under the MIT license.
 """
 
 from dataclasses import dataclass, field
+import datetime as dt
 from enum import Enum
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+import uuid
+import xml.etree.ElementTree as ET
 
 import requests
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
@@ -36,6 +39,10 @@ ENDPOINT_HOLIDAYS = "/ISAPI/System/Holidays"
 ENDPOINT_REBOOT = "/ISAPI/System/reboot"
 ENDPOINT_EVENT_TRIGGERS = "/ISAPI/Event/triggers"
 ENDPOINT_SMART_CAPABILITIES = "/ISAPI/Smart/capabilities"
+ENDPOINT_CONTENTMGMT_SEARCH = "/ISAPI/ContentMgmt/search"
+
+# Recording search timeout (larger than default, searches can be slow)
+RECORDING_SEARCH_TIMEOUT = 30
 
 # Event detection endpoints
 EVENT_ENDPOINTS: Dict[str, str] = {
@@ -162,6 +169,26 @@ class DeviceCapabilities:
     support_storage: bool = False
     num_io_outputs: int = 0
     num_io_inputs: int = 0
+
+
+@dataclass
+class Recording:
+    """Video recording segment."""
+
+    source_id: str
+    track_id: int
+    start_time: dt.datetime
+    end_time: dt.datetime
+    content_type: str = "video"
+    playback_uri: str = ""
+
+
+@dataclass
+class RecordingDay:
+    """Day with recordings available."""
+
+    date: dt.datetime
+    has_recordings: bool = True
 
 
 class ISAPIClient:
@@ -577,6 +604,120 @@ class ISAPIClient:
         except (ISAPINotFoundError, ISAPIError):
             return []
 
+    def get_input_proxy_channels(self) -> List[CameraInfo]:
+        """Get NVR input proxy channels (connected cameras).
+
+        Returns:
+            List of CameraInfo (without streams populated).
+        """
+        response = self.request(HTTPMethod.GET, ENDPOINT_INPUT_PROXY_CHANNELS)
+        channels = response.get("InputProxyChannelList", {}).get(
+            "InputProxyChannel", []
+        )
+        if isinstance(channels, dict):
+            channels = [channels]
+
+        cameras: List[CameraInfo] = []
+        for ch in channels:
+            try:
+                ch_id = int(ch.get("id", 0))
+            except (ValueError, TypeError):
+                continue
+            cameras.append(
+                CameraInfo(
+                    id=ch_id,
+                    name=ch.get("name", f"Channel {ch_id}"),
+                    model=ch.get("model"),
+                    serial_number=ch.get("serialNumber"),
+                    input_port=(
+                        int(ch.get("inputPort"))
+                        if ch.get("inputPort") is not None
+                        else None
+                    ),
+                )
+            )
+        return cameras
+
+    def find_camera(self, name: str) -> Optional[CameraInfo]:
+        """Find a camera by name (supports Chinese, fuzzy match).
+
+        Args:
+            name: Camera name or partial name to search.
+
+        Returns:
+            CameraInfo if found, None otherwise.
+        """
+        cameras = self.get_input_proxy_channels()
+        for cam in cameras:
+            if name in cam.name:
+                return cam
+        return None
+
+    def download_recordings(
+        self,
+        camera: str,
+        start_date: dt.datetime,
+        end_date: dt.datetime,
+        output_dir: str = ".",
+    ) -> List[str]:
+        """Download all recordings for a camera in a date range.
+
+        Args:
+            camera: Camera name (e.g., "卧室") or channel number.
+            start_date: Start date.
+            end_date: End date.
+            output_dir: Directory to save files (default: current dir).
+
+        Returns:
+            List of downloaded file paths.
+        """
+        # Resolve camera
+        cam: Optional[CameraInfo] = None
+        if isinstance(camera, str):
+            cam = self.find_camera(camera)
+            if cam is None:
+                try:
+                    channel = int(camera)
+                except ValueError:
+                    raise ISAPIError(f"Camera not found: {camera}")
+            else:
+                channel = cam.id
+        else:
+            channel = camera
+
+        # Search all recordings in date range
+        recordings = self.search_recordings(
+            channel=channel,
+            start_time=start_date,
+            end_time=end_date,
+            max_results=1000,
+        )
+
+        if not recordings:
+            _LOGGER.info("No recordings found for channel %s", channel)
+            return []
+
+        # Download each recording
+        import os
+
+        downloaded: List[str] = []
+        cam_name = cam.name if cam else f"ch{channel}"
+        safe_name = cam_name.replace("/", "_").replace(" ", "_")
+
+        for i, rec in enumerate(recordings):
+            ts = rec.start_time.strftime("%Y%m%d_%H%M%S")
+            filename = f"{safe_name}_{ts}_{i}.mp4"
+            filepath = os.path.join(output_dir, filename)
+
+            _LOGGER.info(
+                "Downloading %s ~ %s -> %s",
+                rec.start_time, rec.end_time, filename,
+            )
+            self.download_recording(rec.playback_uri, filepath)
+            downloaded.append(filepath)
+
+        return downloaded
+
     def get_cameras(self) -> List[CameraInfo]:
         """Get camera information with streams."""
         streams = self.get_streaming_channels()
@@ -835,6 +976,256 @@ class ISAPIClient:
         if isinstance(result, bytes):
             return {"raw_bytes": True, "length": len(result)}
         return result
+
+    # --- Recording search / download -----------------------------------
+
+    @staticmethod
+    def _track_id(channel: int, stream_type: int = 1) -> int:
+        """Convert channel number to ISAPI track ID."""
+        return channel * 100 + stream_type
+
+    def get_recording_days(
+        self,
+        channel: int = 1,
+        start_date: Optional[dt.datetime] = None,
+        end_date: Optional[dt.datetime] = None,
+    ) -> List[RecordingDay]:
+        """Get days with recordings for a channel.
+
+        Args:
+            channel: Camera channel number (default 1).
+            start_date: Start date (default: 30 days ago).
+            end_date: End date (default: today).
+
+        Returns:
+            List of RecordingDay sorted by date descending.
+        """
+        if end_date is None:
+            end_date = dt.datetime.now()
+        if start_date is None:
+            start_date = end_date - dt.timedelta(days=30)
+
+        days: Dict[str, RecordingDay] = {}
+        window = dt.timedelta(days=1)
+        current = start_date
+
+        while current < end_date:
+            window_end = min(current + window, end_date)
+            try:
+                results = self.search_recordings(
+                    channel=channel,
+                    start_time=current,
+                    end_time=window_end,
+                    max_results=500,
+                )
+                for rec in results:
+                    key = rec.start_time.strftime("%Y-%m-%d")
+                    if key not in days:
+                        days[key] = RecordingDay(
+                            date=rec.start_time.replace(
+                                hour=0, minute=0, second=0, microsecond=0
+                            ),
+                            has_recordings=True,
+                        )
+            except ISAPIError:
+                pass
+
+            current = window_end
+
+        return sorted(days.values(), key=lambda d: d.date, reverse=True)
+
+    def search_recordings(
+        self,
+        channel: int = 1,
+        start_time: Optional[dt.datetime] = None,
+        end_time: Optional[dt.datetime] = None,
+        max_results: int = 100,
+    ) -> List[Recording]:
+        """Search recordings by channel and time range.
+
+        Args:
+            channel: Camera channel number (default 1).
+            start_time: Start time (default: 1 hour ago).
+            end_time: End time (default: now).
+            max_results: Maximum results to return.
+
+        Returns:
+            List of Recording sorted by start_time descending.
+        """
+        if end_time is None:
+            end_time = dt.datetime.now()
+        if start_time is None:
+            start_time = end_time - dt.timedelta(hours=1)
+
+        track_id = self._track_id(channel)
+
+        search_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            "<CMSearchDescription>"
+            "<searchID>{search_id}</searchID>"
+            "<trackIDList><trackID>{track_id}</trackID></trackIDList>"
+            "<timeSpanList>"
+            "<timeSpan>"
+            "<startTime>{start}Z</startTime>"
+            "<endTime>{end}Z</endTime>"
+            "</timeSpan>"
+            "</timeSpanList>"
+            "<maxResults>{max_results}</maxResults>"
+            "<searchResultPosition>0</searchResultPosition>"
+            "<metadataList>"
+            "<metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>"
+            "</metadataList>"
+            "</CMSearchDescription>"
+        ).format(
+            search_id=str(uuid.uuid4()).upper(),
+            track_id=track_id,
+            start=start_time.strftime("%Y-%m-%dT%H:%M:%S"),
+            end=end_time.strftime("%Y-%m-%dT%H:%M:%S"),
+            max_results=max_results,
+        )
+
+        self._detect_auth_method()
+        url = f"{self.base_url}{ENDPOINT_CONTENTMGMT_SEARCH}"
+
+        try:
+            response = self._session.post(
+                url,
+                auth=self._auth,
+                data=search_xml,
+                headers={"Content-Type": "application/xml"},
+                timeout=RECORDING_SEARCH_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as err:
+            raise ISAPIConnectionError(f"Recording search failed: {err}") from err
+
+        if response.status_code == 401:
+            raise ISAPIAuthError("Invalid credentials")
+        if response.status_code == 404:
+            raise ISAPINotFoundError(
+                f"Search endpoint not found: {ENDPOINT_CONTENTMGMT_SEARCH}"
+            )
+        if response.status_code >= 400:
+            raise ISAPIError(
+                f"Recording search failed with status {response.status_code}"
+            )
+
+        return self._parse_recording_results(response.text)
+
+    def _parse_recording_results(self, xml_text: str) -> List[Recording]:
+        """Parse CMSearchResult XML into Recording list."""
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return []
+
+        recordings: List[Recording] = []
+
+        for match in root.iter():
+            if "searchMatchItem" not in match.tag:
+                continue
+
+            source_id = ""
+            track_id_val = 0
+            rec_start = None
+            rec_end = None
+            playback_uri = ""
+            content_type = "video"
+
+            for child in match:
+                tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+                if tag == "sourceID" and child.text:
+                    source_id = child.text
+                elif tag == "trackID" and child.text:
+                    try:
+                        track_id_val = int(child.text)
+                    except ValueError:
+                        pass
+                elif tag == "timeSpan":
+                    for tc in child:
+                        ttag = tc.tag.split("}")[-1] if "}" in tc.tag else tc.tag
+                        if ttag == "startTime" and tc.text:
+                            rec_start = self._parse_iso(tc.text)
+                        elif ttag == "endTime" and tc.text:
+                            rec_end = self._parse_iso(tc.text)
+                elif tag == "mediaSegmentDescriptor":
+                    for mc in child:
+                        mtag = mc.tag.split("}")[-1] if "}" in mc.tag else mc.tag
+                        if mtag == "playbackURI" and mc.text:
+                            playback_uri = mc.text
+                        elif mtag == "contentType" and mc.text:
+                            content_type = mc.text
+
+            if rec_start is not None and rec_end is not None:
+                recordings.append(
+                    Recording(
+                        source_id=source_id,
+                        track_id=track_id_val,
+                        start_time=rec_start,
+                        end_time=rec_end,
+                        content_type=content_type,
+                        playback_uri=playback_uri,
+                    )
+                )
+
+        return sorted(recordings, key=lambda r: r.start_time, reverse=True)
+
+    @staticmethod
+    def _parse_iso(text: str) -> Optional[dt.datetime]:
+        """Parse ISO 8601 timestamp, with or without Z suffix."""
+        try:
+            return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return dt.datetime.fromisoformat(text.rstrip("Z"))
+            except ValueError:
+                return None
+
+    def download_recording(
+        self,
+        playback_uri: str,
+        output_path: str,
+        chunk_size: int = 8192,
+    ) -> None:
+        """Download a recording to a local file.
+
+        Args:
+            playback_uri: The playback URI from a Recording.
+            output_path: Local file path to save to.
+            chunk_size: Stream chunk size in bytes.
+
+        Raises:
+            ISAPIError: Download failed.
+        """
+        url = playback_uri
+        if url.startswith("/"):
+            url = f"{self.base_url}{url}"
+
+        self._detect_auth_method()
+
+        try:
+            response = self._session.get(
+                url,
+                auth=self._auth,
+                stream=True,
+                timeout=(10, 60),  # (connect, read)
+            )
+        except requests.exceptions.RequestException as err:
+            raise ISAPIConnectionError(f"Download failed: {err}") from err
+
+        if response.status_code == 401:
+            raise ISAPIAuthError("Invalid credentials")
+        if response.status_code == 404:
+            raise ISAPINotFoundError(f"Recording not found: {playback_uri}")
+        if response.status_code >= 400:
+            raise ISAPIError(f"Download failed with status {response.status_code}")
+
+        with open(output_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+
+    # --- context manager ---
 
     def close(self) -> None:
         """Close the client session."""
